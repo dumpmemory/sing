@@ -22,32 +22,16 @@ import (
 	"github.com/sagernet/sing/protocol/shadowsocks"
 	"github.com/sagernet/sing/protocol/shadowsocks/shadowaead"
 	"github.com/sagernet/sing/protocol/socks"
-	"golang.org/x/crypto/chacha20"
-	"golang.org/x/crypto/chacha20poly1305"
 	wgReplay "golang.zx2c4.com/wireguard/replay"
 	"lukechampine.com/blake3"
 )
 
 const (
-	HeaderTypeClient      = 0
-	HeaderTypeServer      = 1
-	MaxPaddingLength      = 900
-	KeySaltSize           = 32
-	PacketNonceSize       = 24
-	MinRequestHeaderSize  = 1 + 8
-	MinResponseHeaderSize = MinRequestHeaderSize + KeySaltSize
-	MaxPacketSize         = 65535 + shadowaead.PacketLengthBufferSize + nonceSize*2
-)
-
-const (
-	// crypto/cipher.gcmStandardNonceSize
-	// golang.org/x/crypto/chacha20poly1305.NonceSize
-	nonceSize = 12
-
-	// Overhead
-	// crypto/cipher.gcmTagSize
-	// golang.org/x/crypto/chacha20poly1305.Overhead
-	overhead = 16
+	HeaderTypeClient = 0
+	HeaderTypeServer = 1
+	MaxPaddingLength = 900
+	KeySaltSize      = 32
+	MaxPacketSize    = 65535
 )
 
 var (
@@ -62,7 +46,6 @@ var (
 var List = []string{
 	"2022-blake3-aes-128-gcm",
 	"2022-blake3-aes-256-gcm",
-	"2022-blake3-chacha20-poly1305",
 }
 
 func New(method string, pskList [][]byte, secureRNG io.Reader) (shadowsocks.Method, error) {
@@ -103,11 +86,6 @@ func New(method string, pskList [][]byte, secureRNG io.Reader) (shadowsocks.Meth
 		m.constructor = newAESGCM
 		m.blockConstructor = newAES
 		m.udpBlockCipher = newAES(m.psk)
-	case "2022-blake3-chacha20-poly1305":
-		m.keyLength = 32
-		m.constructor = newChacha20Poly1305
-		m.streamConstructor = newChacha20
-		m.udpCipher = newXChacha20Poly1305(m.psk)
 	}
 	return m, nil
 }
@@ -135,37 +113,17 @@ func newAESGCM(key []byte) cipher.AEAD {
 	return aead
 }
 
-func newChacha20(key []byte) cipher.Stream {
-	_nonce := make([]byte, chacha20.NonceSize)
-	stream, _ := chacha20.NewUnauthenticatedCipher(key, common.Dup(_nonce))
-	return stream
-}
-
-func newChacha20Poly1305(key []byte) cipher.AEAD {
-	cipher, err := chacha20poly1305.New(key)
-	common.Must(err)
-	return cipher
-}
-
-func newXChacha20Poly1305(key []byte) cipher.AEAD {
-	cipher, err := chacha20poly1305.NewX(key)
-	common.Must(err)
-	return cipher
-}
-
 type Method struct {
-	name              string
-	keyLength         int
-	constructor       func(key []byte) cipher.AEAD
-	blockConstructor  func(key []byte) cipher.Block
-	streamConstructor func(key []byte) cipher.Stream
-	udpCipher         cipher.AEAD
-	udpBlockCipher    cipher.Block
-	psk               []byte
-	pskList           [][]byte
-	pskHash           []byte
-	secureRNG         io.Reader
-	replayFilter      replay.Filter
+	name             string
+	keyLength        int
+	constructor      func(key []byte) cipher.AEAD
+	blockConstructor func(key []byte) cipher.Block
+	udpBlockCipher   cipher.Block
+	psk              []byte
+	pskList          [][]byte
+	pskHash          []byte
+	secureRNG        io.Reader
+	replayFilter     replay.Filter
 }
 
 func (m *Method) Name() string {
@@ -174,30 +132,6 @@ func (m *Method) Name() string {
 
 func (m *Method) KeyLength() int {
 	return m.keyLength
-}
-
-func (m *Method) WriteExtendedIdentityHeaders(request *buf.Buffer, salt []byte) {
-	pskLen := len(m.pskList)
-	if pskLen < 2 {
-		return
-	}
-	for i, psk := range m.pskList {
-		keyMaterial := make([]byte, 2*KeySaltSize)
-		copy(keyMaterial, psk)
-		copy(keyMaterial[KeySaltSize:], salt)
-		_identitySubkey := buf.Make(m.keyLength)
-		identitySubkey := common.Dup(_identitySubkey)
-		blake3.DeriveKey(identitySubkey, "shadowsocks 2022 identity subkey", keyMaterial)
-		pskHash := m.pskHash[aes.BlockSize*i : aes.BlockSize*(i+1)]
-		if m.blockConstructor != nil {
-			m.blockConstructor(identitySubkey).Encrypt(request.Extend(16), pskHash)
-		} else {
-			m.streamConstructor(identitySubkey).XORKeyStream(request.Extend(16), pskHash)
-		}
-		if i == pskLen-2 {
-			break
-		}
-	}
 }
 
 func (m *Method) DialConn(conn net.Conn, destination *M.AddrPort) (net.Conn, error) {
@@ -236,18 +170,38 @@ type clientConn struct {
 	writer io.Writer
 }
 
+func (m *Method) writeExtendedIdentityHeaders(request *buf.Buffer, salt []byte) {
+	pskLen := len(m.pskList)
+	if pskLen < 2 {
+		return
+	}
+	for i, psk := range m.pskList {
+		keyMaterial := make([]byte, 2*KeySaltSize)
+		copy(keyMaterial, psk)
+		copy(keyMaterial[KeySaltSize:], salt)
+		_identitySubkey := buf.Make(m.keyLength)
+		identitySubkey := common.Dup(_identitySubkey)
+		blake3.DeriveKey(identitySubkey, "shadowsocks 2022 identity subkey", keyMaterial)
+		pskHash := m.pskHash[aes.BlockSize*i : aes.BlockSize*(i+1)]
+		m.blockConstructor(identitySubkey).Encrypt(request.Extend(16), pskHash)
+		if i == pskLen-2 {
+			break
+		}
+	}
+}
+
 func (c *clientConn) writeRequest(payload []byte) error {
-	request := buf.New()
-	defer request.Release()
+	_request := buf.StackNew()
+	request := common.Dup(_request)
 
 	salt := make([]byte, KeySaltSize)
 	common.Must1(io.ReadFull(c.method.secureRNG, salt))
 	common.Must1(request.Write(salt))
-	c.method.WriteExtendedIdentityHeaders(request, salt)
+	c.method.writeExtendedIdentityHeaders(request, salt)
 
-	var writer io.Writer = c.Conn
+	var writer io.Writer
 	writer = &buf.BufferedWriter{
-		Writer: writer,
+		Writer: c.Conn,
 		Buffer: request,
 	}
 
@@ -258,8 +212,8 @@ func (c *clientConn) writeRequest(payload []byte) error {
 		MaxPacketSize,
 	)
 
-	header := buf.New()
-	defer header.Release()
+	_header := buf.StackNew()
+	header := common.Dup(_header)
 
 	writer = &buf.BufferedWriter{
 		Writer: writer,
@@ -362,6 +316,7 @@ func (c *clientConn) readResponse() error {
 		return ErrBadRequestSalt
 	}
 
+	c.requestSalt = nil
 	c.reader = reader
 	return nil
 }
@@ -417,35 +372,17 @@ type clientPacketConn struct {
 
 func (c *clientPacketConn) WritePacket(buffer *buf.Buffer, destination *M.AddrPort) error {
 	defer buffer.Release()
-	header := buf.New()
+	_header := buf.StackNew()
+	header := common.Dup(_header)
 	pskLen := len(c.method.pskList)
-	var dataIndex int
-	if c.method.udpCipher != nil {
-		common.Must1(header.ReadFullFrom(c.method.secureRNG, PacketNonceSize))
-		if pskLen > 1 {
-			for i, psk := range c.method.pskList {
-				pskHash := c.method.pskHash[aes.BlockSize*i : aes.BlockSize*(i+1)]
-				identityHeader := header.Extend(aes.BlockSize)
-				for textI := 0; textI < aes.BlockSize; textI++ {
-					identityHeader[textI] = pskHash[textI] ^ header.Byte(textI)
-				}
-				c.method.streamConstructor(psk).XORKeyStream(identityHeader, identityHeader)
-				if i == pskLen-2 {
-					break
-				}
-			}
-		}
-		dataIndex = buffer.Len()
-	} else {
-		dataIndex = aes.BlockSize
-	}
+	dataIndex := aes.BlockSize
 
 	common.Must(
 		binary.Write(header, binary.BigEndian, c.session.sessionId),
 		binary.Write(header, binary.BigEndian, c.session.nextPacketId()),
 	)
 
-	if c.method.udpCipher == nil && pskLen > 1 {
+	if pskLen > 1 {
 		for i, psk := range c.method.pskList {
 			dataIndex += aes.BlockSize
 			pskHash := c.method.pskHash[aes.BlockSize*i : aes.BlockSize*(i+1)]
@@ -469,15 +406,10 @@ func (c *clientPacketConn) WritePacket(buffer *buf.Buffer, destination *M.AddrPo
 		return err
 	}
 	buffer = buffer.WriteBufferAtFirst(header)
-	if c.method.udpCipher != nil {
-		c.method.udpCipher.Seal(buffer.Index(dataIndex), buffer.To(dataIndex), buffer.From(dataIndex), nil)
-		buffer.Extend(c.method.udpCipher.Overhead())
-	} else {
-		packetHeader := buffer.To(aes.BlockSize)
-		c.session.cipher.Seal(buffer.Index(dataIndex), packetHeader[4:16], buffer.From(dataIndex), nil)
-		buffer.Extend(c.session.cipher.Overhead())
-		c.method.udpBlockCipher.Encrypt(packetHeader, packetHeader)
-	}
+	packetHeader := buffer.To(aes.BlockSize)
+	c.session.cipher.Seal(buffer.Index(dataIndex), packetHeader[4:16], buffer.From(dataIndex), nil)
+	buffer.Extend(c.session.cipher.Overhead())
+	c.method.udpBlockCipher.Encrypt(packetHeader, packetHeader)
 	return common.Error(c.Write(buffer.Bytes()))
 }
 
@@ -488,17 +420,8 @@ func (c *clientPacketConn) ReadPacket(buffer *buf.Buffer) (*M.AddrPort, error) {
 	}
 	buffer.Truncate(n)
 
-	var packetHeader []byte
-	if c.method.udpCipher != nil {
-		_, err = c.method.udpCipher.Open(buffer.Index(PacketNonceSize), buffer.To(PacketNonceSize), buffer.From(PacketNonceSize), nil)
-		if err != nil {
-			return nil, E.Cause(err, "decrypt packet")
-		}
-		buffer.Advance(PacketNonceSize)
-	} else {
-		packetHeader = buffer.To(aes.BlockSize)
-		c.method.udpBlockCipher.Decrypt(packetHeader, packetHeader)
-	}
+	packetHeader := buffer.To(aes.BlockSize)
+	c.method.udpBlockCipher.Decrypt(packetHeader, packetHeader)
 
 	var sessionId, packetId uint64
 	err = binary.Read(buffer, binary.BigEndian, &sessionId)
@@ -613,11 +536,9 @@ func (m *Method) newUDPSession() *udpSession {
 		sessionId: rand.Uint64(),
 		filter:    new(wgReplay.Filter),
 	}
-	if m.udpCipher == nil {
-		sessionId := make([]byte, 8)
-		binary.BigEndian.PutUint64(sessionId, session.sessionId)
-		key := Blake3DeriveKey(m.psk, sessionId, m.keyLength)
-		session.cipher = m.constructor(common.Dup(key))
-	}
+	sessionId := make([]byte, 8)
+	binary.BigEndian.PutUint64(sessionId, session.sessionId)
+	key := Blake3DeriveKey(m.psk, sessionId, m.keyLength)
+	session.cipher = m.constructor(common.Dup(key))
 	return session
 }
